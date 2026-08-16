@@ -33,6 +33,19 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 // ==================== LECTURE PDF ====================
+//
+//  Le PDF est un tableau. pdf.js fournit la position (x, y) de chaque
+//  fragment de texte : on reconstitue les lignes puis les colonnes, au
+//  lieu d'aplatir la page en un flux de mots. Un nom composé
+//  ("BEN ALI", "DA SILVA", "VAN DEN BERG") occupe une seule cellule et
+//  reste donc entier.
+
+const TOLERANCE_LIGNE = 3;      // px : deux fragments à la même hauteur
+const ECART_COLONNE = 6;        // px : au-delà, on change de cellule
+const REGEX_DATE = /\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b/;
+const REGEX_DOSSIER = /^\d{6,}$/;
+
+let dernierDiagnostic = null;
 
 async function lirePDF(event) {
     const fichier = event.target.files[0];
@@ -46,190 +59,368 @@ async function lirePDF(event) {
             const pdf = await pdfjsLib.getDocument(e.target.result).promise;
             passagers = [];
 
+            let colonnes = null;
+            let lignesTotal = 0;
+
             for (let i = 1; i <= pdf.numPages; i++) {
                 const page = await pdf.getPage(i);
                 const textContent = await page.getTextContent();
-                const texte = textContent.items.map(item => item.str).join(" ");
-                
-                console.log(`Page ${i} texte:`, texte.substring(0, 200));
-                
-                extrairePassagersDuTexte(texte);
+
+                const lignes = reconstituerLignes(textContent.items);
+                lignesTotal += lignes.length;
+
+                const colonnesPage = detecterColonnes(lignes);
+                if (!colonnes || colonnesPage.source === "en-tête") colonnes = colonnesPage;
+
+                extrairePassagersDesLignes(lignes, colonnesPage);
             }
 
-            console.log("Total passagers extraits:", passagers.length);
-            console.log("Premiers passagers:", passagers.slice(0, 3));
+            // Repli : si la lecture par colonnes ne donne rien, on retente
+            // l'ancienne méthode par flux de mots.
+            let methode = "colonnes (" + (colonnes ? colonnes.source : "?") + ")";
+            if (passagers.length === 0) {
+                for (let i = 1; i <= pdf.numPages; i++) {
+                    const page = await pdf.getPage(i);
+                    const textContent = await page.getTextContent();
+                    extrairePassagersDuTexte(textContent.items.map(it => it.str).join(" "));
+                }
+                methode = "flux de mots (repli)";
+            }
+
+            dernierDiagnostic = {
+                pages: pdf.numPages,
+                lignes: lignesTotal,
+                methode: methode,
+                colonnes: colonnes
+            };
+            console.log("[PDF] " + passagers.length + " passagers — méthode : " + methode, colonnes);
 
             sauvegarderDonnees();
-
-            document.getElementById("resultat").innerHTML =
-                "Passagers chargés : " + passagers.length;
-
+            afficherStatutChargement(passagers.length, methode);
             mettreAJourStats();
+
         } catch (erreur) {
             console.error("Erreur lecture PDF :", erreur);
-            document.getElementById("resultat").innerHTML = "Erreur : " + erreur.message;
+            afficherStatutChargement(null, null, erreur.message);
         }
     };
 
     reader.readAsArrayBuffer(fichier);
 }
 
-// Extrait les passagers du texte PDF
+function afficherStatutChargement(nombre, methode, erreur) {
+    const cible = document.getElementById("resultat");
+    cible.textContent = "";
+
+    if (erreur) {
+        cible.textContent = "⚠️ Erreur de lecture : " + erreur;
+        return;
+    }
+
+    if (nombre === 0) {
+        cible.textContent = "⚠️ Aucun passager reconnu dans ce PDF.";
+        return;
+    }
+
+    cible.textContent = "✅ " + nombre + " passagers chargés (lecture par " + methode + ")";
+}
+
+// --- Regrouper les fragments de texte en lignes ---------------
+
+function reconstituerLignes(items) {
+    const lignes = [];
+
+    items.forEach(item => {
+        const texte = (item.str || "").trim();
+        if (!texte) return;
+
+        const x = item.transform[4];
+        const y = item.transform[5];
+
+        let ligne = lignes.find(l => Math.abs(l.y - y) <= TOLERANCE_LIGNE);
+
+        if (!ligne) {
+            ligne = { y: y, fragments: [] };
+            lignes.push(ligne);
+        }
+
+        ligne.fragments.push({ x: x, largeur: item.width || 0, texte: texte });
+    });
+
+    lignes.sort((a, b) => b.y - a.y);                        // du haut vers le bas
+    lignes.forEach(l => l.fragments.sort((a, b) => a.x - b.x));
+
+    return lignes.map(l => ({ y: l.y, cellules: fusionnerEnCellules(l.fragments) }));
+}
+
+// --- Fusionner les fragments proches en cellules --------------
+
+function fusionnerEnCellules(fragments) {
+    const cellules = [];
+    let courante = null;
+
+    fragments.forEach(f => {
+        if (courante && f.x - (courante.x + courante.largeur) <= ECART_COLONNE) {
+            courante.texte += " " + f.texte;
+            courante.largeur = (f.x + f.largeur) - courante.x;
+        } else {
+            courante = { x: f.x, largeur: f.largeur, texte: f.texte };
+            cellules.push(courante);
+        }
+    });
+
+    return cellules.map(c => ({ x: c.x, texte: c.texte.replace(/\s+/g, " ").trim() }));
+}
+
+// --- Repérer l'en-tête et l'index des colonnes ----------------
+
+function detecterColonnes(lignes) {
+    for (const ligne of lignes) {
+        const textes = ligne.cellules.map(c => c.texte.toLowerCase());
+
+        const iNom = textes.findIndex(t => /^n(om)?\.?$/.test(t) || /\bnom\b/.test(t));
+        const iPrenom = textes.findIndex(t => /^pr[ée]nom/.test(t) || /\bpr[ée]nom\b/.test(t));
+
+        if (iNom !== -1 && iPrenom !== -1 && iNom !== iPrenom) {
+            return {
+                source: "en-tête",
+                nom: iNom,
+                prenom: iPrenom,
+                naissance: textes.findIndex(t => /naissance|date de n|birth|d\.?d\.?n/.test(t)),
+                dossier: textes.findIndex(t => /dossier|r[ée]serv|booking|billet/.test(t)),
+                yEntete: ligne.y
+            };
+        }
+    }
+
+    // Repli : 3e colonne = Nom, 4e colonne = Prénom
+    return { source: "position par défaut", nom: 2, prenom: 3, naissance: -1, dossier: -1, yEntete: null };
+}
+
+// --- Extraire les passagers des lignes ------------------------
+
+function cellule(ligne, index) {
+    if (index < 0 || index >= ligne.cellules.length) return "";
+    return ligne.cellules[index].texte;
+}
+
+function extrairePassagersDesLignes(lignes, colonnes) {
+    const colonnesMin = Math.max(colonnes.nom, colonnes.prenom) + 1;
+
+    lignes.forEach(ligne => {
+        if (colonnes.yEntete !== null && ligne.y >= colonnes.yEntete) return;
+        if (ligne.cellules.length < colonnesMin) return;
+
+        const nom = cellule(ligne, colonnes.nom);
+        const prenom = cellule(ligne, colonnes.prenom);
+
+        if (!contientDesLettres(nom)) return;
+
+        const toutes = ligne.cellules.map(c => c.texte);
+
+        let naissance = colonnes.naissance !== -1 ? cellule(ligne, colonnes.naissance) : "";
+        if (REGEX_DATE.test(naissance)) {
+            naissance = naissance.match(REGEX_DATE)[0];
+        } else {
+            const trouvee = toutes.find(t => REGEX_DATE.test(t));
+            naissance = trouvee ? trouvee.match(REGEX_DATE)[0] : "";
+        }
+
+        let dossier = colonnes.dossier !== -1 ? cellule(ligne, colonnes.dossier) : "";
+        if (!REGEX_DOSSIER.test(dossier)) {
+            dossier = toutes.find(t => REGEX_DOSSIER.test(t)) || "";
+        }
+
+        const nomPropre = nettoyerCellule(nom);
+        const prenomPropre = nettoyerCellule(prenom);
+
+        const doublon = passagers.some(p =>
+            p.nom === nomPropre && p.prenom === prenomPropre && p.naissance === naissance);
+        if (doublon) return;
+
+        passagers.push({
+            id: passagers.length,
+            dossier: dossier,
+            nom: nomPropre,
+            prenom: prenomPropre,
+            naissance: naissance,
+            controle: false,
+            heureControle: "",
+            cartouches: 0,
+            bouteilles: 0
+        });
+    });
+}
+
+function contientDesLettres(texte) {
+    return /[A-Za-zÀ-ÖØ-öø-ÿŒœÆæ]{2,}/.test(texte || "");
+}
+
+function nettoyerCellule(texte) {
+    return (texte || "").replace(/[,;]+$/, "").replace(/\s+/g, " ").trim().toUpperCase();
+}
+
+// --- Ancienne extraction, conservée comme repli ---------------
+
 function extrairePassagersDuTexte(texte) {
-    // Normaliser le texte
-    texte = texte.replace(/\r\n/g, "\n");
-    
-    const lignes = texte.split(/\s+/); // Split par tous les espaces
-    
-    // Chercher les patterns : AAAA BBBB DD/MM/YYYY
+    const mots = texte.replace(/\r\n/g, "\n").split(/\s+/);
+
     let i = 0;
-    while (i < lignes.length) {
-        const ligne = lignes[i];
-        
-        // Vérifier si c'est un mot potentiel de nom (MAJUSCULES)
-        if (estNomValide(ligne, "PDF", "nom")) {
-            
-            // Chercher le prochain mot (potentiel prénom)
-            if (i + 1 < lignes.length) {
-                const prenom = lignes[i + 1];
-                
-                if (estNomValide(prenom, "PDF", "prénom")) {
-                    
-                    // Chercher la date (DD/MM/YYYY)
-                    let dateIndex = i + 2;
-                    let dateFound = false;
-                    let date = "";
-                    
-                    // Chercher dans les 5 prochains éléments
-                    for (let j = i + 2; j < Math.min(i + 7, lignes.length); j++) {
-                        if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(lignes[j])) {
-                            date = lignes[j];
-                            dateFound = true;
-                            break;
-                        }
-                    }
-                    
-                    if (dateFound && date) {
-                        const nom = ligne.toUpperCase();
-                        const prenom_final = prenom.toUpperCase();
-                        
-                        // Chercher le N° dossier (9 chiffres avant)
-                        let dossier = "";
-                        for (let j = Math.max(0, i - 5); j < i; j++) {
-                            if (/^\d{9,}$/.test(lignes[j])) {
-                                dossier = lignes[j];
-                                break;
-                            }
-                        }
-                        
-                        // Vérifier qu'on n'a pas déjà ce passager
-                        const existe = passagers.some(p => 
-                            p.nom === nom && p.prenom === prenom_final && p.naissance === date
-                        );
-                        
-                        if (!existe) {
-                            passagers.push({
-                                id: passagers.length,
-                                dossier: dossier,
-                                nom: nom,
-                                prenom: prenom_final,
-                                naissance: date,
-                                controle: false,
-                                heureControle: "",
-                                cartouches: 0,
-                                bouteilles: 0
-                            });
-                            
-                            console.log("✓ Passager trouvé:", nom, prenom_final, date, dossier);
-                        }
-                        
-                        i = dateIndex + 1;
-                        continue;
-                    }
+    while (i < mots.length) {
+        if (estNomValide(mots[i], "PDF", "nom") && i + 1 < mots.length &&
+            estNomValide(mots[i + 1], "PDF", "prénom")) {
+
+            let date = "";
+            let indexDate = -1;
+
+            for (let j = i + 2; j < Math.min(i + 7, mots.length); j++) {
+                if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(mots[j])) {
+                    date = mots[j];
+                    indexDate = j;
+                    break;
                 }
             }
+
+            if (date) {
+                const nom = mots[i].toUpperCase();
+                const prenom = mots[i + 1].toUpperCase();
+
+                let dossier = "";
+                for (let j = Math.max(0, i - 5); j < i; j++) {
+                    if (/^\d{9,}$/.test(mots[j])) { dossier = mots[j]; break; }
+                }
+
+                const doublon = passagers.some(p =>
+                    p.nom === nom && p.prenom === prenom && p.naissance === date);
+
+                if (!doublon) {
+                    passagers.push({
+                        id: passagers.length, dossier: dossier, nom: nom, prenom: prenom,
+                        naissance: date, controle: false, heureControle: "",
+                        cartouches: 0, bouteilles: 0
+                    });
+                }
+
+                i = indexDate + 1;      // corrigé : on repart après la date réellement trouvée
+                continue;
+            }
         }
-        
         i++;
     }
 }
 
 // ==================== RECHERCHE ====================
+//
+//  Insensible aux accents, aux traits d'union et aux apostrophes.
+//  Tous les mots saisis doivent être présents, dans n'importe quel
+//  ordre : « fatma ben ali » trouve BEN ALI Fatma.
+
+const MAX_RESULTATS_AFFICHES = 100;
+
+// Deux formes de comparaison, mises en cache sur le passager :
+//   espacée : "BEN ALI FATMA 12/03/1985"
+//   collée  : "BENALIFATMA12/03/1985"  (retrouve O'BRIEN en tapant OBRIEN)
+function texteRecherche(p) {
+    if (!p._recherche) {
+        const espacee = normaliserTexte(
+            [p.nom, p.prenom, p.naissance, p.dossier].filter(Boolean).join(" ")
+        );
+        p._recherche = { espacee: espacee, collee: espacee.replace(/ /g, "") };
+    }
+    return p._recherche;
+}
+
+function filtrerPassagers(saisie) {
+    const termes = normaliserTexte(saisie).split(" ").filter(Boolean);
+    if (termes.length === 0) return [];
+
+    return passagers.filter(p => {
+        const cible = texteRecherche(p);
+        return termes.every(t =>
+            cible.espacee.includes(t) || cible.collee.includes(t.replace(/ /g, ""))
+        );
+    });
+}
+
+function echapperHtml(valeur) {
+    return String(valeur == null ? "" : valeur)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
 
 function rechercherInstantane() {
-    const texte = document
-        .getElementById("recherche")
-        .value
-        .trim()
-        .toUpperCase();
+    const saisie = document.getElementById("recherche").value.trim();
+    const resultat = document.getElementById("resultatRecherche");
 
-    const resultat =
-        document.getElementById("resultatRecherche");
-
-    console.log("Recherche:", texte, "Total passagers:", passagers.length);
-
-    if (texte.length < 2) {
+    if (saisie.length < 2) {
         resultat.innerHTML = "";
         return;
     }
 
-    const trouves = passagers
-        .filter(p => {
-            const recherche =
-                (
-                    p.nom + " " +
-                    p.prenom + " " +
-                    p.naissance
-                )
-                .toUpperCase();
+    const trouves = filtrerPassagers(saisie);
 
-            return recherche.includes(texte);
-        })
-        .slice(0, 30);
+    if (trouves.length === 0) {
+        resultat.innerHTML = '<p class="aucun-resultat">Aucun passager ne correspond à « ' +
+            echapperHtml(saisie) + ' ».</p>';
+        return;
+    }
 
-    console.log("Résultats trouvés:", trouves.length);
+    const affiches = trouves.slice(0, MAX_RESULTATS_AFFICHES);
 
-    let html = "";
+    let html = '<p class="compteur-resultats">' + trouves.length + ' passager' +
+        (trouves.length > 1 ? 's' : '') + ' trouvé' + (trouves.length > 1 ? 's' : '');
 
-    trouves.forEach(p => {
+    if (trouves.length > affiches.length) {
+        html += ' — ' + affiches.length + ' affichés, affinez la recherche';
+    }
+    html += '</p>';
+
+    affiches.forEach(p => {
+        const nom = echapperHtml(p.nom);
+        const prenom = echapperHtml(p.prenom);
+        const naissance = echapperHtml(p.naissance || "-");
+        const dossier = echapperHtml(p.dossier || "-");
+        const id = Number(p.id);
+
         html += `
             <div class="passager ${p.controle ? 'deja-controle' : 'non-controle'}">
 
-                <strong>
-                    ${p.nom} ${p.prenom}
-                </strong><br>
+                <strong>${nom} ${prenom}</strong><br>
 
                 <span class="passenger-detail">
-                    Date de naissance : ${p.naissance || "-"}
+                    Date de naissance : ${naissance}
                 </span><br>
 
                 <span class="passenger-detail">
-                    Dossier : ${p.dossier || "-"}
+                    Dossier : ${dossier}
                 </span>
         `;
 
         if (p.controle) {
             html += `
                 <div class="control-status">
-                    ✓ Contrôlé : ${p.heureControle}
+                    ✓ Contrôlé : ${echapperHtml(p.heureControle)}
                 </div>
 
                 <div class="quantity-section">
                     <div class="quantity-group">
                         <label>Cartouches :</label>
-                        <span class="quantity-value">${p.cartouches}</span>
+                        <span class="quantity-value">${Number(p.cartouches) || 0}</span>
                         <div class="button-group">
-                            <button onclick="modifierCartouches(${p.id},1)" class="btn-plus">+</button>
-                            <button onclick="modifierCartouches(${p.id},-1)" class="btn-minus">−</button>
+                            <button onclick="modifierCartouches(${id},1)" class="btn-plus">+</button>
+                            <button onclick="modifierCartouches(${id},-1)" class="btn-minus">−</button>
                         </div>
                     </div>
 
                     <div class="quantity-group">
                         <label>Bouteilles :</label>
-                        <span class="quantity-value">${p.bouteilles}</span>
+                        <span class="quantity-value">${Number(p.bouteilles) || 0}</span>
                         <div class="button-group">
-                            <button onclick="modifierBouteilles(${p.id},1)" class="btn-plus">+</button>
-                            <button onclick="modifierBouteilles(${p.id},-1)" class="btn-minus">−</button>
+                            <button onclick="modifierBouteilles(${id},1)" class="btn-plus">+</button>
+                            <button onclick="modifierBouteilles(${id},-1)" class="btn-minus">−</button>
                         </div>
                     </div>
                 </div>
@@ -237,18 +428,14 @@ function rechercherInstantane() {
         } else {
             html += `
                 <div class="control-action">
-                    <button
-                        onclick="validerControle(${p.id})"
-                        class="btn-control">
+                    <button onclick="validerControle(${id})" class="btn-control">
                         ✓ Contrôler
                     </button>
                 </div>
             `;
         }
 
-        html += `
-            </div>
-        `;
+        html += `</div>`;
     });
 
     resultat.innerHTML = html;
@@ -308,25 +495,28 @@ function mettreAJourStats() {
     const cartouches = passagers.reduce((somme, p) => somme + (p.cartouches || 0), 0);
     const bouteilles = passagers.reduce((somme, p) => somme + (p.bouteilles || 0), 0);
 
+    // Les classes stat-total / stat-checked / … portent les couleurs
+    // définies dans style.css : elles doivent être conservées ici, sinon
+    // les tuiles perdent leur mise en forme dès le premier chargement.
     document.getElementById("stats").innerHTML = `
         <div class="stats-grid">
-            <div class="stat-item">
-                <div class="stat-label">Total</div>
+            <div class="stat-item stat-total">
+                <div class="stat-label">👥 Total</div>
                 <div class="stat-value">${total}</div>
             </div>
-            <div class="stat-item">
-                <div class="stat-label">Contrôlés</div>
+            <div class="stat-item stat-checked">
+                <div class="stat-label">✅ Contrôlés</div>
                 <div class="stat-value">${controles}</div>
             </div>
-            <div class="stat-item">
-                <div class="stat-label">Restants</div>
+            <div class="stat-item stat-remaining">
+                <div class="stat-label">⏳ Restants</div>
                 <div class="stat-value">${restants}</div>
             </div>
-            <div class="stat-item">
+            <div class="stat-item stat-cigarettes">
                 <div class="stat-label">🚬 Cartouches</div>
                 <div class="stat-value">${cartouches}</div>
             </div>
-            <div class="stat-item">
+            <div class="stat-item stat-bottles">
                 <div class="stat-label">🍾 Bouteilles</div>
                 <div class="stat-value">${bouteilles}</div>
             </div>
@@ -563,7 +753,10 @@ function afficherResultatsScanner(resultats) {
 // ==================== SAUVEGARDE ====================
 
 function sauvegarderDonnees() {
-    localStorage.setItem("passagers", JSON.stringify(passagers));
+    // le cache de recherche (_recherche) n'est pas persiste : il est
+    // reconstruit a la volee, et alourdirait inutilement le stockage
+    const aStocker = passagers.map(({ _recherche, ...reste }) => reste);
+    localStorage.setItem("passagers", JSON.stringify(aStocker));
 }
 
 function chargerDonneesSauvegardees() {
