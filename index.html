@@ -140,8 +140,23 @@
         </div>
     </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.4/tesseract.min.js"></script>
+<!-- Bibliothèques tierces chargées depuis un CDN.
+     L'attribut integrity fait vérifier au navigateur l'empreinte du fichier reçu :
+     toute altération (CDN compromis, interception réseau) empêche l'exécution du
+     script au lieu de la laisser passer silencieusement.
+     Empreintes publiées par cdnjs, recoupées avec les artefacts npm officiels
+     pdfjs-dist@3.11.174 et tesseract.js@5.0.4.
+     Attention : l'intégrité ne couvre que ces deux fichiers. tesseract.js télécharge
+     ensuite son worker et son cœur WebAssembly, qui restent non vérifiés tant que les
+     bibliothèques ne sont pas hébergées dans le dépôt. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"
+        integrity="sha512-q+4liFwdPC/bNdhUpZx6aXDx/h77yEQtn4I1slHydcbZK34nLaR3cAeYSJshoxIOq3mjEf7xJE8YWIUHMn+oCQ=="
+        crossorigin="anonymous"
+        referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.4/tesseract.min.js"
+        integrity="sha512-2wYKf5SRmHOMuTUmSsOkTTwejJrRcL6oHK5zHw/8MPUwZgTEekmapU6UOkxs0KFy20eWWmCiL30fZoVrtRkcPQ=="
+        crossorigin="anonymous"
+        referrerpolicy="no-referrer"></script>
 <script src="export.js"></script>
 <script src="app.js"></script>
 
