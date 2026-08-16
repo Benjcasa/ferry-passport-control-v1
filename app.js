@@ -719,35 +719,28 @@ function afficherResultatsScanner(resultats) {
         return;
     }
 
-    if (resultats.length === 1) {
-        // Un seul résultat : valider directement
-        const p = resultats[0];
-        listeResultats.innerHTML = `
+    // Les champs viennent du PDF puis transitent par le localStorage :
+    // ils sont échappés à l'affichage, comme dans la recherche.
+    const carte = (p, libelle) => `
             <div class="passager non-controle">
-                <strong>${p.nom} ${p.prenom}</strong><br>
-                <span class="passenger-detail">Date : ${p.naissance}</span><br>
-                <button onclick="validerControle(${p.id}); fermerScanner();" class="btn-control">
-                    ✓ Valider ce passager
+                <strong>${echapperHtml(p.nom)} ${echapperHtml(p.prenom)}</strong><br>
+                <span class="passenger-detail">Date : ${echapperHtml(p.naissance || "-")}</span><br>
+                <button onclick="validerControle(${Number(p.id)}); fermerScanner();" class="btn-control">
+                    ${libelle}
                 </button>
             </div>
         `;
+
+    if (resultats.length === 1) {
+        // Un seul résultat : valider directement
+        listeResultats.innerHTML = carte(resultats[0], "✓ Valider ce passager");
         return;
     }
 
     // Plusieurs résultats : afficher liste
-    let html = "";
-    resultats.forEach(p => {
-        html += `
-            <div class="passager non-controle">
-                <strong>${p.nom} ${p.prenom}</strong><br>
-                <span class="passenger-detail">Date : ${p.naissance}</span><br>
-                <button onclick="validerControle(${p.id}); fermerScanner();" class="btn-control">
-                    ✓ C'est lui
-                </button>
-            </div>
-        `;
-    });
-    listeResultats.innerHTML = html;
+    listeResultats.innerHTML = resultats
+        .map(p => carte(p, "✓ C'est lui"))
+        .join("");
 }
 
 // ==================== SAUVEGARDE ====================
@@ -759,11 +752,56 @@ function sauvegarderDonnees() {
     localStorage.setItem("passagers", JSON.stringify(aStocker));
 }
 
+// Le localStorage n'est pas une source de confiance : il est partagé par
+// toutes les pages de la même origine. On revalide donc chaque
+// enregistrement relu, au lieu de le réinjecter tel quel dans l'affichage.
+function assainirPassager(brut, index) {
+    if (!brut || typeof brut !== "object") return null;
+
+    const texte = v => (typeof v === "string" ? v.slice(0, 100).trim() : "");
+    const entierPositif = v =>
+        Number.isFinite(v) ? Math.max(0, Math.trunc(v)) : 0;
+
+    const nom = texte(brut.nom);
+    if (!nom) return null;
+
+    return {
+        id: index,
+        dossier: texte(brut.dossier),
+        nom: nom,
+        prenom: texte(brut.prenom),
+        naissance: texte(brut.naissance),
+        controle: brut.controle === true,
+        heureControle: texte(brut.heureControle),
+        cartouches: entierPositif(brut.cartouches),
+        bouteilles: entierPositif(brut.bouteilles)
+    };
+}
+
 function chargerDonneesSauvegardees() {
     const donnees = localStorage.getItem("passagers");
 
     if (!donnees) return;
 
-    passagers = JSON.parse(donnees);
+    let brut;
+    try {
+        brut = JSON.parse(donnees);
+    } catch (erreur) {
+        console.warn("Données sauvegardées illisibles, elles sont ignorées.", erreur);
+        return;
+    }
+
+    if (!Array.isArray(brut)) {
+        console.warn("Données sauvegardées au mauvais format, elles sont ignorées.");
+        return;
+    }
+
+    passagers = brut.map(assainirPassager).filter(Boolean);
+
+    const rejetes = brut.length - passagers.length;
+    if (rejetes > 0) {
+        console.warn(rejetes + " enregistrement(s) sauvegardé(s) rejeté(s) à la relecture.");
+    }
+
     mettreAJourStats();
 }
